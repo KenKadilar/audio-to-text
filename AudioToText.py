@@ -121,6 +121,9 @@ SUPPORTED_INPUT_EXTS = {
     ".ogg",
 }
 
+# Measured on a noisy recorded mix: hallucinated loop runs fell from 129 to 2.
+NOISY_MIX_AUDIO_FILTER = "highpass=f=200,loudnorm=I=-16:LRA=11:TP=-1.5,dynaudnorm=f=250:g=15"
+
 ROLE_IGNORE = "Ignore"
 ROLE_MAIN = "Combined / Mixed Track"
 ROLE_SPEAKER_B = "Speaker B (Solo)"
@@ -151,34 +154,6 @@ DEFAULT_PROMPT = (
     "Add punctuation for readability. Preserve names, dates, technical terms, "
     "product / app names, and the speaker's exact wording as accurately as possible."
 )
-
-CLEANUP_PROMPT_TEMPLATE = """# Cleanup Prompt for AI
-
-You are given three transcript files from the same recording.
-
-1. SPEAKER A - Solo audio track of one participant. Single speaker throughout. All lines tagged "Speaker A".
-2. SPEAKER B - Solo audio track of the other participant. Single speaker throughout. All lines tagged "Speaker B".
-3. COMBINED - Full chronological conversation, already labeled "Speaker A" or "Speaker B". The labels were resolved per chunk by comparing the diarized combined-track output against the two solo references. Backchannel noise has been dropped and consecutive same-speaker segments merged into turns.
-
-Your job: polish COMBINED into a final readable transcript by fixing transcription artifacts.
-
-Common issues to fix:
-- **Hallucinated loops**: speech-to-text models sometimes repeat one sentence dozens of times when audio goes silent. Drop them.
-- **Phonetic spelling errors**: names, app names, technical terms, domain-specific words may be misspelled. Cross-check against the solo transcripts and use the clearer spelling.
-- **Mid-sentence speaker splits**: if a phrase starts attributed to one speaker and a fragment is attributed to the other, but the whole sentence makes sense as one speaker's, fix the attribution.
-- **Wrong speaker attribution**: the per-chunk solo cross-reference is good but not perfect. If a turn's content clearly belongs to the other speaker, fix the label.
-
-Do NOT:
-- Translate. Preserve the original language(s) as spoken.
-- Summarize or rewrite into formal prose.
-- Drop substantive content.
-- Change timestamps.
-
-Output format (same as COMBINED, with corrections applied):
-[00:00:00.000 - 00:00:05.000] Speaker A: ...
-[00:00:05.200 - 00:00:09.000] Speaker B: ...
-"""
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Portable paths / resources
@@ -488,6 +463,7 @@ def extract_track_to_chunks(
     chunk_seconds: int,
     clear_old_chunks: bool,
     log_fn: Callable[[str], None],
+    audio_filter: str = "",
 ) -> dict[str, Any]:
     ffmpeg_path = find_tool("ffmpeg")
     label = str(track.get("label") or f"Track {track.get('audio_position', 0) + 1}").strip()
@@ -503,6 +479,10 @@ def extract_track_to_chunks(
 
     chunk_pattern = str(chunks_dir / "chunk_%03d.wav")
 
+    filter_args: list[str] = []
+    if audio_filter.strip():
+        filter_args = ["-af", audio_filter.strip()]
+
     cmd = [
         ffmpeg_path,
         "-nostdin",
@@ -512,10 +492,13 @@ def extract_track_to_chunks(
         "-map",
         f"0:a:{audio_position}",
         "-vn",
+        *filter_args,
         *ffmpeg_common_chunk_output_args(chunk_seconds, chunk_pattern),
     ]
 
     log_fn(f"Extracting {label} [{role}] from {track.get('map_spec')} into WAV chunks...")
+    if filter_args:
+        log_fn(f"  Audio filter: {audio_filter.strip()}")
     completed = subprocess.run(
         cmd,
         text=True,
@@ -702,6 +685,29 @@ def _tokenize_for_match(text: str) -> set[str]:
     return {token for token in no_punct.split() if len(token) >= 2}
 
 
+def _ngrams(text: str, size: int) -> set[tuple[str, ...]]:
+    lowered = re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)
+    words = [token for token in lowered.split() if len(token) >= 2]
+    return {tuple(words[i:i + size]) for i in range(max(0, len(words) - size + 1))}
+
+
+def phrase_containment(text: str, reference: str, size: int = 2) -> float:
+    """Share of the text's word pairs that also appear in the reference.
+
+    Bag-of-words matching misleads when the reference is long: any sentence in the same
+    language scores high because its individual words all occur somewhere. Word pairs only
+    match when the same phrasing was actually spoken, which is what distinguishes a speaker's
+    own line from someone else's line about the same subject.
+    """
+    candidate = _ngrams(text, size)
+    if not candidate:
+        return -1.0
+    referenceGrams = _ngrams(reference, size)
+    if not referenceGrams:
+        return 0.0
+    return len(candidate & referenceGrams) / len(candidate)
+
+
 def _containment(label_tokens: set[str], solo_tokens: set[str]) -> float:
     """|label ∩ solo| / min(|label|, |solo|).
 
@@ -722,6 +728,11 @@ def _containment(label_tokens: set[str], solo_tokens: set[str]) -> float:
 _MIN_LABEL_TOKENS_FOR_RESOLUTION = 5
 # Winner must beat the loser by this multiple, else the raw S-label stays.
 _MIN_RESOLUTION_MARGIN = 1.3
+# Small labels score spuriously (a one-word turn found in the solo scores a perfect 1.00).
+_MIN_SINGLE_SOLO_TOKENS = 10
+# Measured gap on real sessions is 0.47 to 0.85, so this band sits comfortably inside it.
+_SINGLE_SOLO_HIGH = 0.70
+_SINGLE_SOLO_LOW = 0.55
 
 
 def resolve_combined_speakers(
@@ -814,7 +825,15 @@ def resolve_combined_speakers(
             log_fn(note)
             unresolved_notes.append(note.strip())
 
-    # Apply resolved labels; unresolved ones get a global S1/S2/S3 remap in first-appearance order.
+    apply_chunk_resolution(main_segments, resolution)
+    return resolution, unresolved_notes
+
+
+def apply_chunk_resolution(
+    main_segments: list[dict[str, Any]],
+    resolution: dict[int, dict[str, str]],
+) -> None:
+    """Write resolved speakers onto segments; unresolved ones get a session-stable S-label."""
     unresolved_remap: dict[str, str] = {}
     counter = 0
     for seg in main_segments:
@@ -833,6 +852,87 @@ def resolve_combined_speakers(
             seg["raw_speaker"] = raw
             seg["speaker"] = unresolved_remap[key]
 
+
+def resolve_combined_speakers_single_solo(
+    main_segments: list[dict[str, Any]],
+    solo_segments: list[dict[str, Any]],
+    solo_speaker: str,
+    other_speaker: str,
+    log_fn: Callable[[str], None],
+) -> tuple[dict[int, dict[str, str]], list[str]]:
+    """Resolve diarization labels when only one participant has a solo reference.
+
+    Used when the recording captured one side separately (a call app's audio on its own
+    track) while both voices share the main mix. Per chunk, each raw label is scored against
+    the one solo and classified on its own: at or above the high threshold it is the solo
+    speaker, at or below the low one it is the other speaker, and between the two it keeps an
+    S-label. Labels are judged independently rather than as a single winner because the
+    diarizer routinely splits one person across several labels in the same chunk. A chunk
+    where the solo speaker said nothing resolves wholly to other_speaker.
+
+    Returns: ({chunk_index: {raw_label: speaker}}, [unresolved chunk-label notes])
+    """
+    if not main_segments:
+        return {}, []
+
+    main_by_chunk: dict[int, list[dict[str, Any]]] = {}
+    for seg in main_segments:
+        ci = int(seg.get("chunk_index", 0) or 0)
+        main_by_chunk.setdefault(ci, []).append(seg)
+
+    solo_tokens_by_chunk: dict[int, set[str]] = {}
+    solo_text_bucket: dict[int, list[str]] = {}
+    for seg in solo_segments:
+        ci = int(seg.get("chunk_index", 0) or 0)
+        solo_text_bucket.setdefault(ci, []).append(str(seg.get("text", "")).strip())
+    for ci, parts in solo_text_bucket.items():
+        solo_tokens_by_chunk[ci] = _tokenize_for_match(" ".join(parts))
+
+    resolution: dict[int, dict[str, str]] = {}
+    unresolved_notes: list[str] = []
+
+    for ci, segs in sorted(main_by_chunk.items()):
+        solo_tokens = solo_tokens_by_chunk.get(ci, set())
+
+        text_by_label: dict[str, list[str]] = {}
+        for seg in segs:
+            raw = (seg.get("raw_speaker") or seg.get("speaker") or "").strip()
+            if raw:
+                text_by_label.setdefault(raw, []).append(str(seg.get("text", "")).strip())
+
+        scored: dict[str, float] = {}
+        unresolved_in_chunk: list[str] = []
+        for raw, texts in text_by_label.items():
+            label_tokens = _tokenize_for_match(" ".join(texts))
+            if len(label_tokens) < _MIN_SINGLE_SOLO_TOKENS:
+                unresolved_in_chunk.append(f"{raw}(<{_MIN_SINGLE_SOLO_TOKENS}tok)")
+                continue
+            scored[raw] = _containment(label_tokens, solo_tokens)
+
+        label_to_speaker: dict[str, str] = {}
+        if scored and not solo_tokens:
+            for raw in scored:
+                label_to_speaker[raw] = other_speaker
+            log_fn(f"  Chunk {ci}: solo silent, all labels -> {other_speaker}")
+        else:
+            # Each label is judged on its own: the diarizer splits one speaker across several.
+            for raw, score in sorted(scored.items(), key=lambda item: item[1], reverse=True):
+                if score >= _SINGLE_SOLO_HIGH:
+                    label_to_speaker[raw] = solo_speaker
+                elif score <= _SINGLE_SOLO_LOW:
+                    label_to_speaker[raw] = other_speaker
+                else:
+                    unresolved_in_chunk.append(f"{raw}(score={score:.2f}, in dead band)")
+
+        if label_to_speaker:
+            resolution[ci] = label_to_speaker
+            log_fn(f"  Chunk {ci}: {label_to_speaker}")
+        if unresolved_in_chunk:
+            note = f"  Chunk {ci} unresolved labels: {', '.join(unresolved_in_chunk)}"
+            log_fn(note)
+            unresolved_notes.append(note.strip())
+
+    apply_chunk_resolution(main_segments, resolution)
     return resolution, unresolved_notes
 
 
@@ -880,7 +980,9 @@ def transcribe_chunk(
     chunk_path: Path,
     model: str,
     prompt: str,
+    language: str = "",
 ) -> Any:
+    """Transcribe one chunk. Set language (ISO-639-1) to stop whisper translating instead."""
     with open(chunk_path, "rb") as audio_file:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -895,11 +997,15 @@ def transcribe_chunk(
             kwargs["response_format"] = "verbose_json"
             if prompt.strip():
                 kwargs["prompt"] = prompt.strip()
+            if language.strip():
+                kwargs["language"] = language.strip()
         else:
             # gpt-4o-transcribe / gpt-4o-mini-transcribe support json, not verbose_json.
             kwargs["response_format"] = "json"
             if prompt.strip():
                 kwargs["prompt"] = prompt.strip()
+            if language.strip():
+                kwargs["language"] = language.strip()
 
         return client.audio.transcriptions.create(**kwargs)
 
@@ -932,19 +1038,317 @@ def format_segments_markdown(
     return "\n".join(lines).strip() + "\n"
 
 
-def write_cleanup_bundle(
-    bundle_path: Path,
-    sections: list[tuple[str, Path | None]],
-) -> None:
-    parts = [CLEANUP_PROMPT_TEMPLATE.strip(), "", "---", ""]
-    for title, file_path in sections:
-        if not file_path or not file_path.exists():
+def condense_for_context(text: str, max_chars: int = 900) -> str:
+    """Collapse repeated phrases and cap length, for solo text quoted as review context.
+
+    Transcription models emit long hallucinated loops on near-silent audio ("Hi hi." several
+    hundred times). Quoting that verbatim buries the useful context, so runs collapse to a
+    count and the result is truncated.
+    """
+    pieces = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+    collapsed: list[str] = []
+    for piece in pieces:
+        if collapsed and collapsed[-1][0] == piece:
+            collapsed[-1][1] += 1
+        else:
+            collapsed.append([piece, 1])
+
+    rendered: list[str] = []
+    for piece, count in collapsed:
+        if count > 1:
+            rendered.append(f"{piece} (x{count})")
+        else:
+            rendered.append(piece)
+
+    joined = " ".join(rendered)
+    if len(joined) > max_chars:
+        joined = joined[:max_chars].rstrip() + " [...]"
+    return joined
+
+
+def find_loop_runs(text: str, min_repeats: int = 3) -> list[tuple[str, int]]:
+    """Find back-to-back repetition, the transcription hallucination tell.
+
+    Catches both whole-sentence loops and unpunctuated word-level stutters, which the model
+    produces on unintelligible audio and which a sentence-level split alone would miss.
+    """
+    runs: list[tuple[str, int]] = []
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+    index = 0
+    while len(parts) > index:
+        count = 1
+        while len(parts) > index + count and parts[index + count].lower() == parts[index].lower():
+            count += 1
+        if count >= min_repeats:
+            runs.append((parts[index], count))
+        index += count
+
+    words = text.split()
+    for size in range(1, 7):
+        index = 0
+        while len(words) > index + size:
+            phrase = [w.lower() for w in words[index:index + size]]
+            count = 1
+            probe = index + size
+            while len(words) >= probe + size and [w.lower() for w in words[probe:probe + size]] == phrase:
+                count += 1
+                probe += size
+            if count >= max(min_repeats + 1, 4):
+                runs.append((" ".join(words[index:index + size]), count))
+                index = probe
+            else:
+                index += 1
+
+    seen: set[str] = set()
+    unique: list[tuple[str, int]] = []
+    for phrase, count in sorted(runs, key=lambda item: item[1], reverse=True):
+        key = phrase.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append((phrase, count))
+    return unique
+
+
+def find_language_drift(turns: list[dict[str, Any]], min_words: int = 12) -> list[dict[str, Any]]:
+    """Flag substantial turns that look like a different language from the rest of the session.
+
+    Transcription models sometimes invent fluent text in another language when the audio is
+    unintelligible, which reads as plausible content rather than as an obvious error. Sessions
+    spoken in a language that uses accented characters give a cheap signal: a long turn with no
+    accented character at all, inside a session full of them, is worth re-listening to.
+    """
+    def accentedRatio(text: str) -> tuple[float, int]:
+        letters = [c for c in text if c.isalpha()]
+        if not letters:
+            return 0.0, 0
+        return sum(1 for c in letters if ord(c) > 127) / len(letters), len(letters)
+
+    totalLetters = 0
+    totalAccented = 0
+    for turn in turns:
+        ratio, count = accentedRatio(str(turn.get("text", "")))
+        totalLetters += count
+        totalAccented += int(ratio * count)
+    if len(turns) < 10 or not totalLetters:
+        return []
+
+    sessionRatio = totalAccented / totalLetters
+    if sessionRatio < 0.02:
+        return []
+
+    candidates = []
+    for turn in turns:
+        text = str(turn.get("text", "")).strip()
+        ratio, _count = accentedRatio(text)
+        if len(text.split()) >= min_words and ratio < sessionRatio * 0.25:
+            candidates.append(turn)
+    if not candidates:
+        return []
+
+    # A turn in the session's own language reuses its vocabulary; invented text does not.
+    candidateIds = {id(t) for t in candidates}
+    sessionVocab: set[str] = set()
+    for turn in turns:
+        if id(turn) not in candidateIds:
+            sessionVocab |= _tokenize_for_match(str(turn.get("text", "")))
+
+    drifted = []
+    for turn in candidates:
+        tokens = _tokenize_for_match(str(turn.get("text", "")))
+        if not tokens:
             continue
-        body = read_text_if_exists(file_path).strip()
-        if not body:
+        shared = len(tokens & sessionVocab) / len(tokens)
+        if shared < 0.55:
+            drifted.append(turn)
+    return drifted
+
+
+def build_ai_review(
+    session_dir: Path,
+    turns: list[dict[str, Any]],
+    resolution: dict[int, dict[str, str]],
+    resolution_mode: str,
+    notes: list[str],
+    unresolved_notes: list[str],
+    solo_segments_by_speaker: dict[str, list[dict[str, Any]]],
+) -> tuple[str, dict[str, Any]]:
+    """Build the review artifacts: a compact markdown read and the structured payload.
+
+    Everything needed to decide a speaker label lives in one place. Solo text is inlined
+    only for the chunks that still carry an S-label, since that is the only place it helps.
+    """
+    star_turns = [t for t in turns if str(t.get("speaker", "")).startswith("S") and str(t.get("speaker", "")) not in ("Speaker A", "Speaker B")]
+    star_chunks = sorted({int(t.get("chunk_index", 0) or 0) for t in star_turns})
+    star_words = sum(len(str(t.get("text", "")).split()) for t in star_turns)
+
+    payload: dict[str, Any] = {
+        "session": session_dir.name,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "resolution_mode": resolution_mode,
+        "chunk_verdicts": {str(k): v for k, v in sorted(resolution.items())},
+        "unresolved": [n.strip() for n in unresolved_notes],
+        "notes": [n.strip() for n in notes],
+        "counts": {
+            "turns": len(turns),
+            "unresolved_turns": len(star_turns),
+            "unresolved_words": star_words,
+            "unresolved_chunks": star_chunks,
+        },
+        "turns": [
+            {
+                "start": float(t.get("start", 0.0) or 0.0),
+                "end": float(t.get("end", 0.0) or 0.0),
+                "chunk": int(t.get("chunk_index", 0) or 0),
+                "speaker": str(t.get("speaker", "")),
+                "raw": str(t.get("raw_speaker", "")),
+                "text": str(t.get("text", "")).strip(),
+            }
+            for t in turns
+        ],
+    }
+
+    lines = [
+        f"# AI review: {session_dir.name}",
+        "",
+        f"Generated: {payload['generated']}",
+        f"Resolution mode: **{resolution_mode}**",
+        f"Turns: {len(turns)}, unresolved: {len(star_turns)} ({star_words} words)",
+        "",
+        "Structured form of everything below: `ai_review.json`. Edit speakers there and re-render.",
+        "",
+    ]
+
+    if resolution:
+        lines.extend(["## Chunk verdicts", "", "| chunk | label -> speaker |", "|---|---|"])
+        for ci, mapping in sorted(resolution.items()):
+            rendered = ", ".join(f"`{raw}` -> {spk}" for raw, spk in sorted(mapping.items()))
+            lines.append(f"| {ci} | {rendered} |")
+        lines.append("")
+
+    if unresolved_notes:
+        lines.extend(["## Unresolved labels", ""])
+        for note in unresolved_notes:
+            lines.append(f"- {note.strip()}")
+        lines.append("")
+
+    if notes:
+        lines.extend(["## Pipeline notes", ""])
+        for note in notes:
+            lines.append(f"- {note.strip()}")
+        lines.append("")
+
+    if star_chunks and solo_segments_by_speaker:
+        lines.extend([
+            "## Solo reference for unresolved chunks",
+            "",
+            "Only the chunks that still carry an S-label are shown.",
+            "",
+        ])
+        for ci in star_chunks:
+            for speaker, segments in sorted(solo_segments_by_speaker.items()):
+                texts = [
+                    str(s.get("text", "")).strip()
+                    for s in segments
+                    if int(s.get("chunk_index", 0) or 0) == ci
+                ]
+                joined = condense_for_context(" ".join(t for t in texts if t).strip())
+                if joined:
+                    lines.extend([f"**Chunk {ci}, {speaker} solo:**", "", joined, ""])
+
+    loop_hits: list[tuple[dict[str, Any], list[tuple[str, int]]]] = []
+    for turn in turns:
+        runs = find_loop_runs(str(turn.get("text", "")))
+        if runs:
+            loop_hits.append((turn, runs))
+
+    drifted = find_language_drift(turns)
+
+    payload["counts"]["loop_turns"] = len(loop_hits)
+    payload["counts"]["loop_repeats"] = sum(count for _t, runs in loop_hits for _p, count in runs)
+    payload["counts"]["drift_turns"] = len(drifted)
+    payload["counts"]["drift_words"] = sum(len(str(t.get("text", "")).split()) for t in drifted)
+    payload["needs_ear"] = {
+        "language_drift": [
+            {
+                "start": float(turn.get("start", 0.0) or 0.0),
+                "end": float(turn.get("end", 0.0) or 0.0),
+                "speaker": str(turn.get("speaker", "")),
+                "text": str(turn.get("text", "")).strip(),
+            }
+            for turn in drifted
+        ],
+        "loops": [
+            {
+                "start": float(turn.get("start", 0.0) or 0.0),
+                "end": float(turn.get("end", 0.0) or 0.0),
+                "speaker": str(turn.get("speaker", "")),
+                "runs": [{"phrase": phrase, "repeats": count} for phrase, count in runs],
+            }
+            for turn, runs in loop_hits
+        ],
+        "unresolved": [
+            {
+                "start": float(turn.get("start", 0.0) or 0.0),
+                "end": float(turn.get("end", 0.0) or 0.0),
+                "speaker": str(turn.get("speaker", "")),
+                "text": str(turn.get("text", "")).strip(),
+            }
+            for turn in star_turns
+        ],
+    }
+
+    if loop_hits or star_turns or drifted:
+        lines.extend([
+            "## Needs your ear",
+            "",
+            "Timestamps to listen to and correct. Everything else resolved cleanly.",
+            "",
+        ])
+    if drifted:
+        lines.extend([
+            f"### Possible invented passages ({len(drifted)} turns)",
+            "",
+            "Long turns with no accented characters in an otherwise accented session. The model can "
+            "produce fluent text in the wrong language when audio is unintelligible, so these read as "
+            "real content but may be fabricated. Highest priority to check.",
+            "",
+        ])
+        for turn in drifted:
+            start = format_time(float(turn.get("start", 0.0) or 0.0))
+            end = format_time(float(turn.get("end", 0.0) or 0.0))
+            snippet = str(turn.get("text", "")).strip()[:110]
+            lines.append(f"- [{start} - {end}] **{turn.get('speaker', '')}**: {snippet}")
+        lines.append("")
+    if loop_hits:
+        lines.extend([f"### Hallucinated loops ({len(loop_hits)} turns)", ""])
+        for turn, runs in loop_hits:
+            start = format_time(float(turn.get("start", 0.0) or 0.0))
+            end = format_time(float(turn.get("end", 0.0) or 0.0))
+            detail = "; ".join(f'"{phrase[:60]}" x{count}' for phrase, count in runs)
+            lines.append(f"- [{start} - {end}] **{turn.get('speaker', '')}**: {detail}")
+        lines.append("")
+    if star_turns:
+        lines.extend([f"### Unresolved speakers ({len(star_turns)} turns)", ""])
+        for turn in star_turns:
+            start = format_time(float(turn.get("start", 0.0) or 0.0))
+            end = format_time(float(turn.get("end", 0.0) or 0.0))
+            snippet = str(turn.get("text", "")).strip()[:90]
+            lines.append(f"- [{start} - {end}] **{turn.get('speaker', '')}**: {snippet}")
+        lines.append("")
+
+    lines.extend(["## Timeline", ""])
+    for turn in turns:
+        text = str(turn.get("text", "")).strip()
+        if not text:
             continue
-        parts.extend([f"# {title}", "", body, "", "---", ""])
-    bundle_path.write_text("\n".join(parts).strip() + "\n", encoding="utf-8")
+        start = format_time(float(turn.get("start", 0.0) or 0.0))
+        end = format_time(float(turn.get("end", 0.0) or 0.0))
+        speaker = str(turn.get("speaker", "Speaker"))
+        lines.append(f"[{start} - {end}] **{speaker}:** {text}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n", payload
 
 
 def build_session_outputs(
@@ -952,8 +1356,8 @@ def build_session_outputs(
     all_segments: list[dict[str, Any]],
     log_fn: Callable[[str], None],
 ) -> dict[str, Any]:
-    """Group segments by role, resolve combined-track speakers per chunk against
-    the Speaker A / Speaker B solo references, and write the four output files.
+    """Group segments by role, resolve combined-track speakers per chunk against whatever
+    solo references exist, and write the transcript plus AI review outputs.
 
     Assumes:
       - Segments tagged with ROLE_SPEAKER_A or ROLE_SPEAKER_B already have
@@ -976,8 +1380,12 @@ def build_session_outputs(
         seg["speaker"] = "Speaker B"
 
     resolution_notes: list[str] = []
+    resolution: dict[int, dict[str, str]] = {}
+    unresolved: list[str] = []
+    resolution_mode = "none"
     if main_segments:
         if speaker_a_segments and speaker_b_segments:
+            resolution_mode = "two-solo"
             log_fn("Resolving combined-track diarization against solo references...")
             resolution, unresolved = resolve_combined_speakers(
                 main_segments, speaker_a_segments, speaker_b_segments, log_fn
@@ -997,7 +1405,39 @@ def build_session_outputs(
                     "Some labels were ambiguous and left as S-labels for cleanup-AI review: "
                     + "; ".join(n.strip() for n in unresolved)
                 )
+        elif speaker_a_segments or speaker_b_segments:
+            resolution_mode = "single-solo"
+            if speaker_b_segments:
+                solo_segments, solo_speaker, other_speaker, solo_name = (
+                    speaker_b_segments, "Speaker B", "Speaker A", "Speaker B"
+                )
+            else:
+                solo_segments, solo_speaker, other_speaker, solo_name = (
+                    speaker_a_segments, "Speaker A", "Speaker B", "Speaker A"
+                )
+            log_fn(f"Only the {solo_name} solo is available; resolving by elimination...")
+            resolution, unresolved = resolve_combined_speakers_single_solo(
+                main_segments, solo_segments, solo_speaker, other_speaker, log_fn
+            )
+            if resolution:
+                resolution_notes.append(
+                    f"Only the {solo_name} solo reference was available. Each chunk's best "
+                    f"content match against it (containment-via-smaller) classified each label "
+                    f"on its own: at or above {_SINGLE_SOLO_HIGH} it is {solo_speaker}, at or "
+                    f"below {_SINGLE_SOLO_LOW} it is {other_speaker}, between the two it keeps "
+                    f"an S-label: {dict(resolution)}"
+                )
+            else:
+                resolution_notes.append(
+                    f"The {solo_name} solo reference produced no confident chunk matches; raw labels preserved."
+                )
+            if unresolved:
+                resolution_notes.append(
+                    "Some labels were ambiguous and left as S-labels for cleanup-AI review: "
+                    + "; ".join(n.strip() for n in unresolved)
+                )
         else:
+            resolution_mode = "no-solo"
             mapping = remap_main_speakers(main_segments)
             if mapping:
                 resolution_notes.append(
@@ -1015,8 +1455,8 @@ def build_session_outputs(
     speaker_b_path = transcripts_dir / "speaker_b.md"
     combined_path = transcripts_dir / "combined.md"
     extras_path = transcripts_dir / "extras.md"
-    cleanup_prompt_path = transcripts_dir / "cleanup_prompt.md"
-    bundle_path = transcripts_dir / "ai_cleanup_bundle.md"
+    review_md_path = transcripts_dir / "ai_review.md"
+    review_json_path = transcripts_dir / "ai_review.json"
 
     written: dict[str, str] = {}
 
@@ -1036,10 +1476,12 @@ def build_session_outputs(
     else:
         log_fn("No Speaker B-role segments found; skipping speaker_b.md.")
 
+    merged: list[dict[str, Any]] = []
+    notes: list[str] = []
     if main_segments:
         cleaned = drop_backchannel_segments(main_segments)
         merged = merge_consecutive_same_speaker(cleaned)
-        notes: list[str] = list(resolution_notes)
+        notes = list(resolution_notes)
         if any(seg.get("source_label") == "Generated Main Mix" for seg in main_segments):
             notes.append("This combined transcript came from a generated fallback mix, not a real recorded mix track.")
         dropped = len(main_segments) - len(cleaned)
@@ -1061,20 +1503,34 @@ def build_session_outputs(
         written["extras_md"] = str(extras_path)
         log_fn(f"Extras transcript: {extras_path}")
 
-    cleanup_prompt_path.write_text(CLEANUP_PROMPT_TEMPLATE, encoding="utf-8")
-    written["cleanup_prompt"] = str(cleanup_prompt_path)
+    if merged:
+        solo_by_speaker: dict[str, list[dict[str, Any]]] = {}
+        if speaker_a_segments:
+            solo_by_speaker["Speaker A"] = speaker_a_segments
+        if speaker_b_segments:
+            solo_by_speaker["Speaker B"] = speaker_b_segments
 
-    write_cleanup_bundle(
-        bundle_path,
-        sections=[
-            ("SPEAKER A (solo)", speaker_a_path if speaker_a_segments else None),
-            ("SPEAKER B (solo)", speaker_b_path if speaker_b_segments else None),
-            ("COMBINED (chronological, Speaker A/B resolved)", combined_path if main_segments else None),
-            ("EXTRA REFERENCES", extras_path if extra_segments else None),
-        ],
-    )
-    written["ai_cleanup_bundle"] = str(bundle_path)
-    log_fn(f"AI cleanup bundle: {bundle_path}")
+        review_md, review_payload = build_ai_review(
+            session_dir=session_dir,
+            turns=merged,
+            resolution=resolution,
+            resolution_mode=resolution_mode,
+            notes=notes,
+            unresolved_notes=unresolved,
+            solo_segments_by_speaker=solo_by_speaker,
+        )
+        review_md_path.write_text(review_md, encoding="utf-8")
+        review_json_path.write_text(
+            json.dumps(review_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        written["ai_review_md"] = str(review_md_path)
+        written["ai_review_json"] = str(review_json_path)
+        counts = review_payload["counts"]
+        log_fn(
+            f"AI review: {review_md_path} "
+            f"({counts['turns']} turns, {counts['unresolved_turns']} unresolved, "
+            f"{counts['unresolved_words']} words to disambiguate)"
+        )
 
     return written
 
@@ -1265,9 +1721,7 @@ def reprocess_from_raw_json(
     session_dir: Path,
     log_fn: Callable[[str], None],
 ) -> dict[str, Any]:
-    """Regenerate speaker_a.md / speaker_b.md / combined.md / ai_cleanup_bundle.md
-    from existing raw_json/*_segments.json without calling OpenAI.
-    """
+    """Regenerate the transcripts and review files from cached raw_json without calling OpenAI."""
     session_config_path = session_dir / "session_config.json"
     if not session_config_path.exists():
         raise FileNotFoundError(f"session_config.json not found in {session_dir}")
