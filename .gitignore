@@ -7,6 +7,10 @@ DATA/
 *.code-workspace
 *.code-workspace.user
 
+# Local working notes, personal-context pointers, keep out of the public repo
+CLAUDE.md
+HANDOFF.md
+
 # Python
 __pycache__/
 *.py[cod]
