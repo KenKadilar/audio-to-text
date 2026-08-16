@@ -718,12 +718,9 @@ def _containment(label_tokens: set[str], solo_tokens: set[str]) -> float:
     return len(label_tokens & solo_tokens) / min(len(label_tokens), len(solo_tokens))
 
 
-# Minimum tokens a diarized label must have before we trust the per-chunk match.
-# Below this it's basically a one-word turn ("evet", "doğru") where any overlap
-# with either solo is noise.
+# Below this a label is a one-word turn where overlap with either solo is noise.
 _MIN_LABEL_TOKENS_FOR_RESOLUTION = 5
-# Required margin: the winning score must be at least this multiple of the
-# loser. Below this we treat the label as ambiguous and leave the raw S-label.
+# Winner must beat the loser by this multiple, else the raw S-label stays.
 _MIN_RESOLUTION_MARGIN = 1.3
 
 
@@ -817,9 +814,7 @@ def resolve_combined_speakers(
             log_fn(note)
             unresolved_notes.append(note.strip())
 
-    # Apply resolved labels. For still-unresolved labels (raw letters from the
-    # diarize model), do a final global remap to S1/S2/S3 in first-appearance
-    # order so the output is consistent at least within the unresolved set.
+    # Apply resolved labels; unresolved ones get a global S1/S2/S3 remap in first-appearance order.
     unresolved_remap: dict[str, str] = {}
     counter = 0
     for seg in main_segments:
@@ -830,8 +825,7 @@ def resolve_combined_speakers(
             seg["raw_speaker"] = raw
             seg["speaker"] = resolved
         elif raw:
-            # Unresolved: assign a stable S-label so combined.md isn't a mess of A/B/C
-            # that the reader might confuse with the chunk-local diarizer labels.
+            # Stable S-label keeps these distinct from the chunk-local diarizer letters.
             key = f"chunk{ci}:{raw}"
             if key not in unresolved_remap:
                 counter += 1
@@ -1133,11 +1127,37 @@ def transcribe_extracted_tracks(
         if selected_model == "gpt-4o-transcribe-diarize" and prompt.strip():
             log_fn("  Note: diarize model does not use prompt; prompt ignored for this track.")
 
+        raw_path = raw_dir / f"{track_slug}_raw.json"
+        segments_path = raw_dir / f"{track_slug}_segments.json"
+
+        # Resume-aware: load chunks saved by a previous crashed run and skip ahead.
         raw_responses: list[Any] = []
-        cumulative_offset = 0.0
         track_segments: list[dict[str, Any]] = []
+        cumulative_offset = 0.0
+        if raw_path.exists() and segments_path.exists():
+            try:
+                raw_responses = json.loads(raw_path.read_text(encoding="utf-8"))
+                track_segments = json.loads(segments_path.read_text(encoding="utf-8"))
+                if raw_responses:
+                    last = raw_responses[-1]
+                    cumulative_offset = float(last.get("offset_seconds", 0.0)) + float(last.get("duration_seconds", 0.0))
+                all_segments.extend(track_segments)
+                done_chunks += len(raw_responses)
+                log_fn(
+                    f"  Resuming {label}: {len(raw_responses)}/{len(chunk_files)} chunks already saved, "
+                    f"picking up from chunk {len(raw_responses) + 1}."
+                )
+            except Exception as exc:
+                log_fn(f"  Could not resume {label} ({exc}); starting fresh.")
+                raw_responses = []
+                track_segments = []
+                cumulative_offset = 0.0
+
+        already_done = len(raw_responses)
 
         for idx, chunk_path in enumerate(chunk_files, start=1):
+            if idx <= already_done:
+                continue
             log_fn(f"  -> {label}: chunk {idx}/{len(chunk_files)}")
             transcript = transcribe_chunk(client, chunk_path, selected_model, selected_prompt)
             plain = to_plain_data(transcript)
@@ -1205,10 +1225,9 @@ def transcribe_extracted_tracks(
             if progress_fn and total_chunks:
                 progress_fn(int(done_chunks / total_chunks * 100))
 
-        raw_path = raw_dir / f"{track_slug}_raw.json"
-        segments_path = raw_dir / f"{track_slug}_segments.json"
-        raw_path.write_text(json.dumps(raw_responses, ensure_ascii=False, indent=2), encoding="utf-8")
-        segments_path.write_text(json.dumps(track_segments, ensure_ascii=False, indent=2), encoding="utf-8")
+            # Save after each chunk so a mid-track crash cannot lose completed API calls.
+            raw_path.write_text(json.dumps(raw_responses, ensure_ascii=False, indent=2), encoding="utf-8")
+            segments_path.write_text(json.dumps(track_segments, ensure_ascii=False, indent=2), encoding="utf-8")
 
         track_results.append(
             {
