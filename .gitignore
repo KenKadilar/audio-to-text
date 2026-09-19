@@ -10,6 +10,8 @@ DATA/
 # Local working notes, personal-context pointers, keep out of the public repo
 CLAUDE.md
 HANDOFF.md
+you are a coworker.md
+CONTEXT_*.md
 
 # Python
 __pycache__/
