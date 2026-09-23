@@ -1066,6 +1066,78 @@ def condense_for_context(text: str, max_chars: int = 900) -> str:
     return joined
 
 
+def collapse_word_runs(words: list[str], min_repeats: int) -> tuple[list[str], int]:
+    """Fold back-to-back repeats of a 1 to 6 word phrase down to one instance.
+
+    Longest phrase first, so a stutter of a three-word phrase collapses as that phrase
+    instead of being chewed up word by word.
+    """
+    removed = 0
+    size = 6
+    while size >= 1:
+        rebuilt: list[str] = []
+        index = 0
+        while len(words) > index:
+            phrase = [w.lower() for w in words[index:index + size]]
+            count = 1
+            probe = index + size
+            while len(words) >= probe + size and [w.lower() for w in words[probe:probe + size]] == phrase:
+                count += 1
+                probe += size
+            if count >= min_repeats and len(phrase) == size:
+                rebuilt.extend(words[index:index + size])
+                removed += count - 1
+                index = probe
+            else:
+                rebuilt.append(words[index])
+                index += 1
+        words = rebuilt
+        size -= 1
+    return words, removed
+
+
+def collapse_repeated_text(turns: list[dict[str, Any]], min_repeats: int = 3) -> int:
+    """Fold back-to-back repetition inside each turn down to one instance.
+
+    Covers the two shapes find_loop_runs detects: whole-sentence loops, and unpunctuated
+    word stutters that a sentence split alone would miss. The untouched text is stashed
+    on the turn so nothing is removed without a record.
+    """
+    collapsed = 0
+    for turn in turns:
+        text = str(turn.get("text", ""))
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+
+        kept: list[str] = []
+        removed = 0
+        index = 0
+        while len(parts) > index:
+            count = 1
+            while len(parts) > index + count and parts[index + count].lower() == parts[index].lower():
+                count += 1
+            kept.append(parts[index])
+            if count >= min_repeats:
+                removed += count - 1
+                index += count
+            else:
+                kept.extend(parts[index + 1:index + count])
+                index += count
+
+        rebuilt: list[str] = []
+        for part in kept:
+            words, word_removed = collapse_word_runs(part.split(), min_repeats + 1)
+            removed += word_removed
+            rebuilt.append(" ".join(words))
+
+        collapsed_text = " ".join(p for p in rebuilt if p)
+        if removed:
+            turn["original_text"] = text
+            turn["text"] = collapsed_text
+            turn["collapsed_repeats"] = removed
+            collapsed += removed
+    return collapsed
+
+
 def find_loop_runs(text: str, min_repeats: int = 3) -> list[tuple[str, int]]:
     """Find back-to-back repetition, the transcription hallucination tell.
 
@@ -1182,6 +1254,21 @@ def build_ai_review(
     star_chunks = sorted({int(t.get("chunk_index", 0) or 0) for t in star_turns})
     star_words = sum(len(str(t.get("text", "")).split()) for t in star_turns)
 
+    review_turns: list[dict[str, Any]] = []
+    for turn in turns:
+        entry: dict[str, Any] = {
+            "start": float(turn.get("start", 0.0) or 0.0),
+            "end": float(turn.get("end", 0.0) or 0.0),
+            "chunk": int(turn.get("chunk_index", 0) or 0),
+            "speaker": str(turn.get("speaker", "")),
+            "raw": str(turn.get("raw_speaker", "")),
+            "text": str(turn.get("text", "")).strip(),
+        }
+        if turn.get("collapsed_repeats"):
+            entry["collapsed_repeats"] = int(turn.get("collapsed_repeats", 0) or 0)
+            entry["original_text"] = str(turn.get("original_text", "")).strip()
+        review_turns.append(entry)
+
     payload: dict[str, Any] = {
         "session": session_dir.name,
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1195,17 +1282,7 @@ def build_ai_review(
             "unresolved_words": star_words,
             "unresolved_chunks": star_chunks,
         },
-        "turns": [
-            {
-                "start": float(t.get("start", 0.0) or 0.0),
-                "end": float(t.get("end", 0.0) or 0.0),
-                "chunk": int(t.get("chunk_index", 0) or 0),
-                "speaker": str(t.get("speaker", "")),
-                "raw": str(t.get("raw_speaker", "")),
-                "text": str(t.get("text", "")).strip(),
-            }
-            for t in turns
-        ],
+        "turns": review_turns,
     }
 
     lines = [
@@ -1481,6 +1558,7 @@ def build_session_outputs(
     if main_segments:
         cleaned = drop_backchannel_segments(main_segments)
         merged = merge_consecutive_same_speaker(cleaned)
+        repeats_collapsed = collapse_repeated_text(merged)
         notes = list(resolution_notes)
         if any(seg.get("source_label") == "Generated Main Mix" for seg in main_segments):
             notes.append("This combined transcript came from a generated fallback mix, not a real recorded mix track.")
@@ -1489,6 +1567,11 @@ def build_session_outputs(
             notes.append(
                 f"Dropped {dropped} backchannel micro-segment(s) and merged "
                 f"{len(cleaned)} resolved segments into {len(merged)} turns."
+            )
+        if repeats_collapsed:
+            notes.append(
+                f"Collapsed {repeats_collapsed} back-to-back duplicate phrase(s) or sentence(s); "
+                f"each affected turn keeps its untouched text as original_text in ai_review.json."
             )
         combined_md = format_segments_markdown("Combined Chronological Transcript", merged, notes=notes)
         combined_path.write_text(combined_md, encoding="utf-8")
